@@ -37,12 +37,18 @@ Run it in the background all day:
 .\start-background.ps1
 ```
 
-`start-background.ps1` also contains the one-line command to start it automatically at every login.
+To start it automatically at every login (hidden, kept running on battery, restarted if it crashes):
+
+```powershell
+.\install-autostart.ps1
+```
+
+Only one monitor runs at a time; any extra launch exits immediately.
 
 Report options: `--days 1`, `--since 2026-11-01 --until 2026-11-09`, `--out path.html`.
 Monitor tuning: `python monitor.py --help` (thresholds, intervals, router IP override).
 
-Data lives in `data/monitor.db` (SQLite, about 10–15 MB per day). Reports go in `reports/`.
+Data lives in `data/monitor.db` (SQLite, about 18 MB per day). Reports go in `reports/`.
 Time the PC spends asleep is detected and excluded, so reconnect-on-wake doesn't count as an outage.
 
 Requirements: Python 3.10+, standard library only. Full features on Windows. On other OSes it

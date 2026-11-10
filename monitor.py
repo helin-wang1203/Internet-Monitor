@@ -480,7 +480,29 @@ class Monitor:
             self.say(f"Stopped. {self.event_count} event(s) this run. Run `python report.py` for a report.")
 
 
+_instance_lock: socket.socket | None = None
+INSTANCE_PORT = 47823  # localhost port held while a monitor is running
+
+
+def claim_single_instance() -> bool:
+    """False if another monitor is already running (the OS frees the port when it exits)."""
+    global _instance_lock
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if IS_WINDOWS:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        s.bind(("127.0.0.1", INSTANCE_PORT))
+    except OSError:
+        s.close()
+        return False
+    _instance_lock = s
+    return True
+
+
 def main() -> None:
+    if not claim_single_instance():
+        print("Another internet monitor is already running - not starting a second one.")
+        sys.exit(1)
     p = argparse.ArgumentParser(description="Record internet drops and lag spikes.")
     p.add_argument("--db", default=str(DEFAULT_DB), help="SQLite file (default: data/monitor.db)")
     p.add_argument("--gateway", help="router IP (auto-detected if omitted)")
