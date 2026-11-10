@@ -137,19 +137,19 @@ else:
         return float(m.group(1)) if m else None
 
 
-def detect_gateway() -> str | None:
-    """The router address that internet traffic actually goes through."""
+def detect_route() -> tuple[str | None, str | None]:
+    """(router IP, network interface name) that internet traffic actually goes through."""
     if IS_WINDOWS:
         out = _run(["powershell", "-NoProfile", "-Command",
                     "Find-NetRoute -RemoteIPAddress 8.8.8.8 | Where-Object NextHop "
-                    "| Select-Object -ExpandProperty NextHop"], 20)
+                    "| ForEach-Object { \"$($_.NextHop) $($_.InterfaceAlias)\" }"], 20)
         for line in out.splitlines():
-            ip = line.strip()
+            ip, _, iface = line.strip().partition(" ")
             if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip) and ip != "0.0.0.0":
-                return ip
-        return None
-    m = re.search(r"via (\d+\.\d+\.\d+\.\d+)", _run(["ip", "route", "get", "8.8.8.8"], 5))
-    return m.group(1) if m else None
+                return ip, iface or None
+        return None, None
+    m = re.search(r"via (\d+\.\d+\.\d+\.\d+) dev (\S+)", _run(["ip", "route", "get", "8.8.8.8"], 5))
+    return (m.group(1), m.group(2)) if m else (None, None)
 
 
 # --------------------------------------------------------------------------- wifi
@@ -163,6 +163,7 @@ class WifiState:
     channel: str | None = None
     rx_mbps: float | None = None
     tx_mbps: float | None = None
+    name: str | None = None        # Windows interface name, e.g. "Wi-Fi"
 
 
 def read_wifi() -> WifiState | None:
@@ -194,6 +195,7 @@ def read_wifi() -> WifiState | None:
         channel=fields.get("channel"),
         rx_mbps=num("receive rate (mbps)"),
         tx_mbps=num("transmit rate (mbps)"),
+        name=fields.get("name"),
     )
 
 
@@ -211,7 +213,8 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL, cause TEXT NOT NULL,
     internet_loss_pct REAL, worst_rtt_ms REAL,
     gateway_loss_pct REAL, gateway_worst_rtt_ms REAL,
-    min_signal INTEGER, roamed INTEGER, ssid TEXT, bssids TEXT, gateway TEXT);
+    min_signal INTEGER, roamed INTEGER, ssid TEXT, bssids TEXT, gateway TEXT,
+    connection TEXT);
 CREATE INDEX IF NOT EXISTS events_start ON events(start_ts);
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY, start_ts REAL NOT NULL, end_ts REAL NOT NULL,
@@ -225,6 +228,9 @@ class Store:
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")  # lets report.py read while we write
         self.conn.executescript(SCHEMA)
+        # Upgrade databases created before the `connection` column existed.
+        if "connection" not in {r[1] for r in self.conn.execute("PRAGMA table_info(events)")}:
+            self.conn.execute("ALTER TABLE events ADD COLUMN connection TEXT")
         self.pings: list[tuple] = []
         self.wifi: list[tuple] = []
         self.session_id: int | None = None
@@ -262,6 +268,8 @@ class Tick:
     gw_bad: bool
     status: str  # good | lag | down
     wifi: WifiState | None
+    on_wifi: bool          # internet traffic was going over WiFi (not Ethernet etc.)
+    connection: str | None  # interface name the traffic used, e.g. "Wi-Fi" / "Ethernet"
 
 
 def fmt_ms(v: float | None) -> str:
@@ -276,7 +284,8 @@ class Monitor:
         self.print_lock = threading.Lock()
         self.stop = threading.Event()
         self.pool = ThreadPoolExecutor(max_workers=len(PUBLIC_TARGETS) + 1)
-        self.gateway = args.gateway or detect_gateway()
+        gateway, self.iface = detect_route()
+        self.gateway = args.gateway or gateway
         self.wifi: WifiState | None = read_wifi()
         self.wifi_recent: collections.deque = collections.deque(maxlen=400)
         self.pending: list[Tick] = []      # bad ticks not yet long enough to be an event
@@ -296,8 +305,10 @@ class Monitor:
         parts = [f"router {fmt_ms(t.gw_rtt)}" if t.gw_known else "router ?"]
         parts += [f"{ip} {fmt_ms(v)}" for ip, v in t.public.items()]
         w = t.wifi
-        if w:
+        if t.on_wifi and w:
             parts.append(f"WiFi {w.signal}% ch{w.channel}" if w.state == "connected" else f"WiFi {w.state}")
+        elif t.connection:
+            parts.append(f"via {t.connection}")
         state = {"good": "ok  ", "lag": "LAG ", "down": "DOWN"}[t.status]
         if self.event is not None:
             state = "*EVT"
@@ -329,11 +340,15 @@ class Monitor:
                 last_key = key
             else:
                 changed = False
-            if not self.args.gateway and ((changed and w and w.state == "connected")
-                                          or now - last_gw_check > 300):
+            # Re-check the route often enough to notice plugging in / unplugging Ethernet.
+            if (changed and w and w.state == "connected") or now - last_gw_check > 30:
                 last_gw_check = now
-                gw = detect_gateway()
-                if gw and gw != self.gateway:
+                gw, iface = detect_route()
+                # Keep the last known route while offline, so a WiFi drop is still blamed on WiFi.
+                if iface and iface != self.iface:
+                    self.say(f"Internet traffic now goes via {iface} (was {self.iface})")
+                    self.iface = iface
+                if gw and gw != self.gateway and not self.args.gateway:
                     self.say(f"Router address is now {gw} (was {self.gateway})")
                     self.gateway = gw
 
@@ -349,7 +364,12 @@ class Monitor:
         gw_bad = gw_known and (gw_rtt is None or gw_rtt > self.args.gw_lag_ms)
         with self.lock:
             wifi = self.wifi
-        return Tick(ts, public, gw_known, gw_rtt, gw_bad, status, wifi)
+        iface = self.iface
+        if iface and wifi and wifi.name:
+            on_wifi = iface == wifi.name
+        else:  # route unknown: assume WiFi only if WiFi is actually connected
+            on_wifi = wifi is not None and wifi.state == "connected"
+        return Tick(ts, public, gw_known, gw_rtt, gw_bad, status, wifi, on_wifi, iface)
 
     def on_tick(self, t: Tick) -> None:
         bad = t.status != "good"
@@ -380,14 +400,22 @@ class Monitor:
         got = [v for v in pub if v is not None]
         gw = [t.gw_rtt for t in ticks if t.gw_known]
         gw_got = [v for v in gw if v is not None]
-        signals = [t.wifi.signal for t in ticks if t.wifi and t.wifi.signal is not None]
-
-        with self.lock:
-            nearby = [w for ts, w in self.wifi_recent if start - 10 <= ts <= end + 3]
-        nearby += [t.wifi for t in ticks if t.wifi]
+        # WiFi only matters if the internet traffic was actually going over it.
+        on_wifi = any(t.on_wifi for t in ticks)
+        signals = [t.wifi.signal for t in ticks
+                   if on_wifi and t.wifi and t.wifi.signal is not None]
+        if on_wifi:
+            with self.lock:
+                nearby = [w for ts, w in self.wifi_recent if start - 10 <= ts <= end + 3]
+            nearby += [t.wifi for t in ticks if t.wifi]
+        else:
+            nearby = []
         bssids = sorted({w.bssid for w in nearby if w.bssid})
         disconnected = any(w.state != "connected" for w in nearby)
         roamed = len(bssids) > 1
+        connection = next((t.connection for t in reversed(ticks) if t.connection), None)
+        if on_wifi:
+            connection = "WiFi"
 
         if disconnected:
             cause = "wifi_disconnect"
@@ -410,6 +438,7 @@ class Monitor:
             gateway_worst_rtt_ms=max(gw_got) if gw_got else None,
             min_signal=min(signals) if signals else None,
             roamed=int(roamed), ssid=ssid, bssids=", ".join(bssids), gateway=self.gateway,
+            connection=connection,
         )
         self.store.add_event(row)
         router = (f"router loss {row['gateway_loss_pct']:.0f}%" if gw else "router unknown")
@@ -420,7 +449,7 @@ class Monitor:
     # ---- main loop
     def run(self) -> None:
         a = self.args
-        self.say(f"Monitoring. Router: {self.gateway or 'unknown'} | targets: "
+        self.say(f"Monitoring. Router: {self.gateway or 'unknown'} via {self.iface or '?'} | targets: "
                  + ", ".join(f"{n} {ip}" for ip, n in PUBLIC_TARGETS.items())
                  + (f" | WiFi: {self.wifi.ssid} ({self.wifi.signal}%)" if self.wifi and self.wifi.ssid else ""))
         self.say(f"Event = {a.min_bad}+ s of loss or latency > {a.lag_ms:.0f} ms; "

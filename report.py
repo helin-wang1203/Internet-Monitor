@@ -300,12 +300,13 @@ def build_html(data: dict, conn: sqlite3.Connection, since: float, until: float)
 
     # ---- event log
     out.append("<h2>Event log</h2><div class='wrap'><table><tr><th>Start</th><th class='n'>Duration</th><th>Type</th>"
-               "<th>Location</th><th class='n'>Internet loss</th><th class='n'>Worst latency</th>"
+               "<th>Location</th><th>Connection</th><th class='n'>Internet loss</th><th class='n'>Worst latency</th>"
                "<th class='n'>Router loss</th><th class='n'>WiFi</th></tr>")
     for e in reversed(ev):
         out.append(f"<tr><td>{esc(when(e['start_ts']))}</td><td class='n'>{dur(e['end_ts'] - e['start_ts'])}</td>"
                    f"<td><span class='pill {e['kind']}'>{KINDS[e['kind']]}</span></td>"
-                   f"<td>{esc(CAUSES[e['cause']][0])}</td><td class='n'>{pct(e['internet_loss_pct'])}</td>"
+                   f"<td>{esc(CAUSES[e['cause']][0])}</td><td>{esc(e.get('connection') or '-')}</td>"
+                   f"<td class='n'>{pct(e['internet_loss_pct'])}</td>"
                    f"<td class='n'>{ms(e['worst_rtt_ms'])}</td><td class='n'>{pct(e['gateway_loss_pct'])}</td>"
                    f"<td class='n'>{pct(e['min_signal'])}{' &#8644;' if e['roamed'] else ''}</td></tr>")
     out.append("</table></div><p class='small muted'>&#8644; = switched WiFi access point during the event. "
@@ -350,7 +351,7 @@ def build_html(data: dict, conn: sqlite3.Connection, since: float, until: float)
 def write_csv(path: Path, events: list[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
-        wr.writerow(["start", "end", "duration_s", "type", "location", "internet_loss_pct",
+        wr.writerow(["start", "end", "duration_s", "type", "location", "connection", "internet_loss_pct",
                      "worst_latency_ms", "router_loss_pct", "router_worst_latency_ms",
                      "min_wifi_signal_pct", "switched_access_point", "network", "access_points", "router"])
         for e in events:
@@ -358,7 +359,7 @@ def write_csv(path: Path, events: list[dict]) -> None:
                 datetime.fromtimestamp(e["start_ts"]).isoformat(timespec="seconds"),
                 datetime.fromtimestamp(e["end_ts"]).isoformat(timespec="seconds"),
                 round(e["end_ts"] - e["start_ts"]), KINDS[e["kind"]], CAUSES[e["cause"]][0],
-                e["internet_loss_pct"], e["worst_rtt_ms"], e["gateway_loss_pct"], e["gateway_worst_rtt_ms"],
+                e.get("connection"), e["internet_loss_pct"], e["worst_rtt_ms"], e["gateway_loss_pct"], e["gateway_worst_rtt_ms"],
                 e["min_signal"], "yes" if e["roamed"] else "no", e["ssid"], e["bssids"], e["gateway"]])
 
 
