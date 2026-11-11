@@ -214,12 +214,49 @@ CREATE TABLE IF NOT EXISTS events (
     internet_loss_pct REAL, worst_rtt_ms REAL,
     gateway_loss_pct REAL, gateway_worst_rtt_ms REAL,
     min_signal INTEGER, roamed INTEGER, ssid TEXT, bssids TEXT, gateway TEXT,
-    connection TEXT);
+    connection TEXT, network TEXT);
 CREATE INDEX IF NOT EXISTS events_start ON events(start_ts);
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY, start_ts REAL NOT NULL, end_ts REAL NOT NULL,
     gateway TEXT, host TEXT);
+-- Which network (WiFi name, or e.g. "Ethernet") was in use for each stretch of time.
+CREATE TABLE IF NOT EXISTS networks (
+    id INTEGER PRIMARY KEY, start_ts REAL NOT NULL, end_ts REAL NOT NULL,
+    network TEXT NOT NULL, connection TEXT);
+CREATE INDEX IF NOT EXISTS networks_start ON networks(start_ts);
 """
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Create tables and upgrade databases made by older versions of this script."""
+    conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    for col in ("connection", "network"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    if not conn.execute("SELECT 1 FROM networks LIMIT 1").fetchone():
+        # Older data: rebuild which WiFi network was in use from the WiFi samples.
+        def add(begin: float, finish: float, ssid: str) -> None:
+            conn.execute("INSERT INTO networks (start_ts, end_ts, network, connection) "
+                         "VALUES (?, ?, ?, 'WiFi')", (begin, finish, ssid))
+        for start, end in conn.execute("SELECT start_ts, end_ts FROM sessions").fetchall():
+            label, begin = None, start
+            for ts, ssid in conn.execute(
+                    "SELECT ts, ssid FROM wifi WHERE ts BETWEEN ? AND ? AND state = 'connected' "
+                    "AND ssid IS NOT NULL ORDER BY ts", (start, end)).fetchall():
+                if ssid == label:
+                    continue
+                if label is not None:
+                    add(begin, ts, label)
+                    begin = ts
+                label = ssid
+            if label is not None:
+                add(begin, end, label)
+    conn.execute(
+        "UPDATE events SET network = COALESCE(ssid, NULLIF(connection, 'WiFi'), "
+        "(SELECT n.network FROM networks n WHERE events.start_ts BETWEEN n.start_ts AND n.end_ts LIMIT 1)) "
+        "WHERE network IS NULL")
+    conn.commit()
 
 
 class Store:
@@ -227,19 +264,25 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")  # lets report.py read while we write
-        self.conn.executescript(SCHEMA)
-        # Upgrade databases created before the `connection` column existed.
-        if "connection" not in {r[1] for r in self.conn.execute("PRAGMA table_info(events)")}:
-            self.conn.execute("ALTER TABLE events ADD COLUMN connection TEXT")
+        migrate(self.conn)
         self.pings: list[tuple] = []
         self.wifi: list[tuple] = []
         self.session_id: int | None = None
+        self.period_id: int | None = None
 
     def start_session(self, ts: float, gateway: str | None) -> None:
         cur = self.conn.execute(
             "INSERT INTO sessions (start_ts, end_ts, gateway, host) VALUES (?, ?, ?, ?)",
             (ts, ts, gateway, socket.gethostname()))
         self.session_id = cur.lastrowid
+        self.period_id = None
+        self.conn.commit()
+
+    def start_period(self, ts: float, network: str, connection: str | None) -> None:
+        cur = self.conn.execute(
+            "INSERT INTO networks (start_ts, end_ts, network, connection) VALUES (?, ?, ?, ?)",
+            (ts, ts, network, connection))
+        self.period_id = cur.lastrowid
         self.conn.commit()
 
     def add_event(self, row: dict) -> None:
@@ -252,6 +295,8 @@ class Store:
         self.conn.executemany("INSERT INTO pings VALUES (?, ?, ?)", self.pings)
         self.conn.executemany("INSERT INTO wifi VALUES (?, ?, ?, ?, ?, ?, ?, ?)", self.wifi)
         self.conn.execute("UPDATE sessions SET end_ts = ? WHERE id = ?", (now, self.session_id))
+        if self.period_id is not None:
+            self.conn.execute("UPDATE networks SET end_ts = ? WHERE id = ?", (now, self.period_id))
         self.conn.commit()
         self.pings.clear()
         self.wifi.clear()
@@ -292,6 +337,7 @@ class Monitor:
         self.event: list[Tick] | None = None
         self.good_streak = 0
         self.event_count = 0
+        self.network: str | None = None  # WiFi name, or interface name like "Ethernet"
 
     # ---- output
     def say(self, msg: str) -> None:
@@ -306,7 +352,8 @@ class Monitor:
         parts += [f"{ip} {fmt_ms(v)}" for ip, v in t.public.items()]
         w = t.wifi
         if t.on_wifi and w:
-            parts.append(f"WiFi {w.signal}% ch{w.channel}" if w.state == "connected" else f"WiFi {w.state}")
+            parts.append(f"'{(w.ssid or '')[:20]}' {w.signal}% ch{w.channel}"
+                         if w.state == "connected" else f"WiFi {w.state}")
         elif t.connection:
             parts.append(f"via {t.connection}")
         state = {"good": "ok  ", "lag": "LAG ", "down": "DOWN"}[t.status]
@@ -438,13 +485,35 @@ class Monitor:
             gateway_worst_rtt_ms=max(gw_got) if gw_got else None,
             min_signal=min(signals) if signals else None,
             roamed=int(roamed), ssid=ssid, bssids=", ".join(bssids), gateway=self.gateway,
-            connection=connection,
+            connection=connection, network=self.network,
         )
         self.store.add_event(row)
         router = (f"router loss {row['gateway_loss_pct']:.0f}%" if gw else "router unknown")
         self.say(f"{KINDS[kind].upper()} {end - start:.0f}s - {CAUSES[cause][0]} | "
                  f"internet loss {row['internet_loss_pct']:.0f}%, worst {fmt_ms(row['worst_rtt_ms'])}, "
                  f"{router}" + (f", WiFi {min(signals)}%" if signals else ""))
+
+    # ---- network tracking
+    def track_network(self, t: Tick) -> bool:
+        """Record which network is in use. True if the user switched networks."""
+        if t.on_wifi:
+            label = t.wifi.ssid if t.wifi and t.wifi.state == "connected" else None
+        else:
+            label = t.connection
+        if not label or label == self.network:
+            return False  # unchanged, or briefly offline: keep the current network
+        switched = self.network is not None
+        if switched:
+            self.say(f"Now on network '{label}' (was '{self.network}') - recording it separately. "
+                     f"Ignoring the next {GRACE_SECONDS}s while it settles.")
+            if self.event is not None:  # the switch itself caused this; don't blame either network
+                self.event_count -= 1
+            self.pending, self.event = [], None
+        self.network = label
+        with self.lock:
+            self.store.flush(t.ts)
+            self.store.start_period(t.ts, label, "WiFi" if t.on_wifi else t.connection)
+        return switched
 
     # ---- main loop
     def run(self) -> None:
@@ -469,6 +538,7 @@ class Monitor:
                     with self.lock:
                         self.store.flush(last_ts)
                     self.store.start_session(ts, self.gateway)
+                    self.network = None  # re-learned (and a new period started) on the next tick
                     grace_until = ts + GRACE_SECONDS
                 last_ts = ts
 
@@ -483,6 +553,8 @@ class Monitor:
                     self.store.pings.append((ts, "gateway", gw_rtt))
 
                 tick = self.make_tick(ts, public, gateway is not None, gw_rtt)
+                if self.track_network(tick):
+                    grace_until = ts + GRACE_SECONDS
                 if ts >= grace_until:
                     self.on_tick(tick)
                 self.status_line(tick)
